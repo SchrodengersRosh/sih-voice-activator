@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+received/
+*.wav
+!test.wav
+.DS_Store
+*.egg-info/
+
