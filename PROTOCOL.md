@@ -1,5 +1,7 @@
 # Protocol v1.0 (Frozen)
 
+**WAV is a test/input container only. Live wire format is WebSocket binary frames as specified below.**
+
 Audio is sent in WebSocket **binary** messages. Controls are WebSocket **text** JSON. A binary JSON payload is explicitly diagnosed and dropped.
 
 ## Audio frame
