@@ -1,0 +1,84 @@
+menu "SIH Voice Activator Configuration"
+
+    menu "Wi-Fi Configuration"
+        config SIH_WIFI_SSID
+            string "Wi-Fi SSID"
+            default "myssid"
+            help
+                SSID of the Wi-Fi network to connect to.
+
+        config SIH_WIFI_PASSWORD
+            string "Wi-Fi Password"
+            default "mypassword"
+            help
+                Password of the Wi-Fi network.
+    endmenu
+
+    menu "Backend Server Configuration"
+        config SIH_SERVER_URI
+            string "Backend WebSocket Server URI"
+            default "ws://192.168.1.100:8765"
+            help
+                WebSocket URI of the streaming ASR backend server.
+
+        config SIH_DEVICE_ID
+            string "Device ID"
+            default "esp32s3-voice-01"
+            help
+                Device identifier sent in the hello handshake message.
+    endmenu
+
+    menu "I2S Microphone Configuration"
+        config SIH_I2S_SCK_GPIO
+            int "I2S Bit Clock (SCK/BCLK) GPIO"
+            default 4
+            range 0 48
+            help
+                GPIO pin connected to I2S SCK / BCLK.
+
+        config SIH_I2S_WS_GPIO
+            int "I2S Word Select (WS/LRCLK) GPIO"
+            default 5
+            range 0 48
+            help
+                GPIO pin connected to I2S WS / LRCLK.
+
+        config SIH_I2S_DIN_GPIO
+            int "I2S Data In (SD/DIN) GPIO"
+            default 6
+            range 0 48
+            help
+                GPIO pin connected to I2S SD / DOUT of microphone.
+
+        config SIH_I2S_32BIT_SLOT
+            bool "Microphone uses 24-bit in 32-bit slot (e.g. INMP441)"
+            default y
+            help
+                Select 'y' if microphone outputs 24-bit samples in 32-bit slots.
+                The driver will extract and scale to canonical signed 16-bit mono PCM.
+    endmenu
+
+    menu "Audio & Detection Settings"
+        config SIH_ENERGY_THRESHOLD_DB
+            int "Energy Gate Threshold (dBFS)"
+            default -50
+            range -90 0
+            help
+                Energy gate threshold in dBFS. Samples below this energy skip KWS inference
+                to minimize power per DEC-INFER-011.
+
+        config SIH_PREBUFFER_MS
+            int "Pre-buffer duration (ms)"
+            default 800
+            help
+                Duration of audio captured prior to wake-word detection (frozen protocol: 800ms).
+
+        config SIH_STREAM_DURATION_MS
+            int "Live audio stream duration after trigger (ms)"
+            default 3000
+            range 1000 10000
+            help
+                Duration of live microphone audio streamed to backend after wake-word detection.
+    endmenu
+
+endmenu
