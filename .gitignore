@@ -8,3 +8,8 @@ received/
 .DS_Store
 *.egg-info/
 vosk-model-*/
+firmware/sdkconfig
+firmware/build/
+firmware/dependencies.lock
+firmware/managed_components/
+.vscode/
