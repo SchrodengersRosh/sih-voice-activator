@@ -95,7 +95,8 @@ class LaptopMicClient:
         self.websocket: Optional[Any] = None
 
         # Timing
-        self.keyword_detected_time: Optional[float] = None
+        self.keyword_detected_time: Optional[float] = None  # T1: when keyword detected
+        self.keyword_end_time: Optional[float] = None       # T0: when keyword audio ends
         self.stream_start_time: Optional[float] = None
         self.stream_end_time: Optional[float] = None
 
@@ -264,7 +265,7 @@ class LaptopMicClient:
             "frame_ms": FRAME_MS,
             "prebuffer_ms": PREBUFFER_MS,
             "live_sample_offset": PREBUFFER_SAMPLES,  # we will send prebuffer first
-            "t_detect_us": int(self.keyword_detected_time * 1_000_000) if self.keyword_detected else 0,
+            "t_detect_us": int((self.keyword_end_time or self.keyword_detected_time or 0) * 1_000_000),
         }
         await self.websocket.send(json.dumps(start_msg))
 
@@ -409,6 +410,15 @@ class LaptopMicClient:
                     pass
                 self.websocket = None
             LOG.info("Client shutting down")
+
+    def set_keyword_end_time(self, end_time: float):
+        """Set the keyword end time for test scenarios (T0 timestamp).
+
+        Args:
+            end_time: Unix timestamp when keyword audio ends
+        """
+        self.keyword_end_time = end_time
+        LOG.debug(f"Keyword end time set to: {end_time:.6f}")
 
     def stop(self):
         """Stop the client."""

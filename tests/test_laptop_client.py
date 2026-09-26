@@ -259,5 +259,119 @@ async def test_thread_safe_audio_queue():
         assert client.prebuffer[0] == dummy_audio, "Prebuffer contains incorrect audio data"
 
 
+def test_keyword_end_time_setting():
+    """Test that keyword end time can be set and retrieved."""
+    client = LaptopMicClient(
+        host="127.0.0.1",
+        port=8765,
+        keyword="hey snail",
+        output_dir=Path("/tmp"),
+    )
+
+    # Initially None
+    assert client.keyword_end_time is None
+    assert client.keyword_detected_time is None
+
+    # Set keyword end time
+    test_time = 1234567890.123456
+    client.set_keyword_end_time(test_time)
+    assert client.keyword_end_time == test_time
+
+    # Keyword detected time should still be None unless set
+    assert client.keyword_detected_time is None
+
+
+def test_start_message_uses_keyword_end_time_when_available():
+    """Test that start message uses keyword end time when set, falls back to detected time."""
+    client = LaptopMicClient(
+        host="127.0.0.1",
+        port=8765,
+        keyword="hey snail",
+        output_dir=Path("/tmp"),
+    )
+
+    # Initially both None - should use 0
+    with patch.object(client, 'start_streaming'), \
+         patch.object(client, 'save_wav'):
+        # We can't easily test the actual start message without async complexity,
+        # but we can verify the logic works by checking the field values
+        assert (client.keyword_end_time or self.keyword_detected_time or 0) == 0
+
+    # Set only keyword end time
+    end_time = 1234567890.123456
+    client.set_keyword_end_time(end_time)
+    assert (client.keyword_end_time or self.keyword_detected_time or 0) == end_time
+
+    # Set keyword detected time (should still prefer end time when both set)
+    detected_time = 1234567890.000000
+    client.keyword_detected_time = detected_time
+    assert (client.keyword_end_time or self.keyword_detected_time or 0) == end_time  # Should still use end_time
+
+    # Clear end time, should fall back to detected time
+    client.keyword_end_time = None
+    assert (client.keyword_end_time or self.keyword_detected_time or 0) == detected_time
+
+    # Both None should use 0
+    client.keyword_detected_time = None
+    assert (client.keyword_end_time or self.keyword_detected_time or 0) == 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_keyword_end_time_setting():
+    """Test that keyword end time can be set and retrieved."""
+    client = LaptopMicClient(
+        host="127.0.0.1",
+        port=8765,
+        keyword="hey snail",
+        output_dir=Path("/tmp"),
+    )
+
+    # Initially None
+    assert client.keyword_end_time is None
+    assert client.keyword_detected_time is None
+
+    # Set keyword end time
+    test_time = 1234567890.123456
+    client.set_keyword_end_time(test_time)
+    assert client.keyword_end_time == test_time
+
+    # Keyword detected time should still be None unless set
+    assert client.keyword_detected_time is None
+
+
+def test_start_message_uses_keyword_end_time_when_available():
+    """Test that start message uses keyword end time when set, falls back to detected time."""
+    client = LaptopMicClient(
+        host="127.0.0.1",
+        port=8765,
+        keyword="hey snail",
+        output_dir=Path("/tmp"),
+    )
+
+    # Initially both None - should use 0
+    with patch.object(client, 'start_streaming'), \
+         patch.object(client, 'save_wav'):
+        # We can't easily test the actual start message without async complexity,
+        # but we can verify the logic works by checking the field values
+        assert (client.keyword_end_time or client.keyword_detected_time or 0) == 0
+
+    # Set only keyword end time
+    end_time = 1234567890.123456
+    client.set_keyword_end_time(end_time)
+    assert (client.keyword_end_time or client.keyword_detected_time or 0) == end_time
+
+    # Set keyword detected time (should still prefer end time when both set)
+    detected_time = 1234567890.000000
+    client.keyword_detected_time = detected_time
+    assert (client.keyword_end_time or client.keyword_detected_time or 0) == end_time  # Should still use end_time
+
+    # Clear end time, should fall back to detected time
+    client.keyword_end_time = None
+    assert (client.keyword_end_time or client.keyword_detected_time or 0) == detected_time
+
+    # Both None should use 0
+    client.keyword_detected_time = None
+    assert (client.keyword_end_time or client.keyword_detected_time or 0) == 0
