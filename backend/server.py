@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,9 +52,32 @@ class Stream:
     asr_thread_started: bool = False
     last_asr_result: Optional[ASRResult] = None
     asr_result_count: int = 0
+    partial_result_count: int = 0
+    final_result_count: int = 0
+    last_partial_text: str = ""
     # Telemetry
     keywords_detected: int = 0
     asr_processing_time_ms: float = 0.0
+
+    def _ensure_asr_worker(self) -> None:
+        """Create and start the ASR worker for this stream if not already started."""
+        if self.asr_thread_started:
+            return
+        try:
+            self.asr_worker = ASRWorker()
+            self.asr_worker.start()
+            self.asr_thread_started = True
+        except Exception as e:
+            # If worker creation fails, leave asr_worker as None and log.
+            LOG.warning("Failed to create ASR worker for stream %d: %s", self.stream_id, e)
+            self.asr_worker = None
+            self.asr_thread_started = True  # Prevent repeated attempts
+
+    def stop_asr_worker(self) -> None:
+        """Stop the ASR worker for this stream."""
+        if self.asr_worker is not None:
+            self.asr_worker.stop()
+            self.asr_worker = None
 
 
 class VoiceServer:
@@ -63,17 +85,6 @@ class VoiceServer:
         self.output_dir = output_dir
         self.inactivity_s = inactivity_s
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        # Global ASR worker pool (shared across streams for efficiency)
-        self._asr_worker_pool: Optional[ASRWorker] = None
-        self._asr_pool_lock = threading.Lock()
-
-    def _get_asr_worker(self) -> ASRWorker:
-        """Get or create ASR worker from pool."""
-        with self._asr_pool_lock:
-            if self._asr_worker_pool is None:
-                self._asr_worker_pool = ASRWorker()
-                self._asr_worker_pool.start()
-            return self._asr_worker_pool
 
     async def handler(self, ws: ServerConnection) -> None:
         hello: dict[str, Any] | None = None
@@ -206,8 +217,10 @@ class VoiceServer:
         # ASR processing: send audio to worker thread (non-blocking)
         asr_start_time = time.perf_counter()
         try:
-            asr_worker = self._get_asr_worker()
-            asr_worker.add_audio(frame.payload)
+            stream._ensure_asr_worker()
+            asr_worker = stream.asr_worker
+            if asr_worker is not None:
+                asr_worker.add_audio(frame.payload)
         except Exception as e:
             LOG.warning("Failed to queue audio for ASR: %s", e)
         finally:
@@ -217,20 +230,33 @@ class VoiceServer:
 
         # Check for ASR results (non-blocking)
         try:
-            asr_result = asr_worker.get_result(timeout=0.001)  # 1ms timeout
-            if asr_result:
-                stream.last_asr_result = asr_result
-                stream.asr_result_count += 1
-                # Simple keyword detection: if we get any text, count it as detected
-                # In a real implementation, this would use a proper keyword spotting model
-                if asr_result.text.strip():
-                    stream.keywords_detected += 1
-                    LOG.info(
-                        "ASR result for stream %d: '%s' (final=%s)",
-                        stream.stream_id,
-                        asr_result.text,
-                        asr_result.is_final,
-                    )
+            asr_worker = stream.asr_worker
+            if asr_worker is not None:
+                asr_result = asr_worker.get_result(timeout=0.001)  # 1ms timeout
+                if asr_result:
+                    stream.last_asr_result = asr_result
+                    stream.asr_result_count += 1
+                    if asr_result.text.strip():
+                        stream.keywords_detected += 1
+                    if asr_result.is_final:
+                        stream.final_result_count += 1
+                        LOG.info(
+                            "ASR result for stream %d: '%s' (final=%s)",
+                            stream.stream_id,
+                            asr_result.text,
+                            asr_result.is_final,
+                        )
+                    else:
+                        # Partial result
+                        stream.partial_result_count += 1
+                        # Only log if partial text changed
+                        if asr_result.text.strip() != stream.last_partial_text:
+                            stream.last_partial_text = asr_result.text.strip()
+                            LOG.debug(
+                                "ASR partial for stream %d: '%s'",
+                                stream.stream_id,
+                                asr_result.text,
+                            )
         except Exception as e:
             LOG.warning("Error getting ASR result: %s", e)
 
@@ -254,13 +280,13 @@ class VoiceServer:
             stream.asr_processing_time_ms,
             path,
         )
+        stream.stop_asr_worker()
         return path
 
     def shutdown(self) -> None:
         """Clean up resources."""
-        if self._asr_worker_pool:
-            self._asr_worker_pool.stop()
-            self._asr_worker_pool = None
+        # No shared resources to clean up; per-stream workers are stopped when the stream ends.
+        pass
 
 
 async def run(host: str, port: int, output_dir: Path) -> None:
@@ -282,7 +308,7 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--output-dir", type=Path, default=Path("received"))
-    parser.add_argument("--debug", action=store_true)
+    parser.add_argument("--debug", action='store_true')
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,

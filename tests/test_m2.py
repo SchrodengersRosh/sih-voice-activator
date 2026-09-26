@@ -1,7 +1,10 @@
 """M2 acceptance tests: simulated ESP32 client with synthetic PCM audio."""
 import asyncio
+import importlib
 import json
+import logging
 import time
+from unittest.mock import patch
 from pathlib import Path
 
 import pytest
@@ -271,3 +274,219 @@ async def test_abrupt_client_disconnect(tmp_path: Path):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_debug_startup(caplog):
+    """Ensure --debug flag sets logging to DEBUG level."""
+    with patch("logging.basicConfig") as mock_basic_config:
+        from backend.server import main
+        import sys
+        # Simulate command-line arguments
+        test_args = ["backend.server", "--debug"]
+        with patch.object(sys, "argv", test_args):
+            # We don't actually want to run the server; replace the run coroutine with a dummy that does nothing
+            async def dummy_run(*args, **kwargs):
+                return None
+            with patch("backend.server.run", new=dummy_run):
+                main()
+                mock_basic_config.assert_called_once()
+                args, kwargs = mock_basic_config.call_args
+                assert kwargs.get("level") == logging.DEBUG
+
+
+@pytest.mark.asyncio
+async def test_missing_asr_initialization(tmp_path, caplog):
+    """Server should handle missing ASR dependency gracefully."""
+    # Patch ASRWorker.__init__ to raise an exception (e.g., ImportError if vosk not installed)
+    with patch("backend.asr.worker.ASRWorker.__init__", side_effect=Exception("Vosk not available")):
+        server = VoiceServer(tmp_path)
+        async with websockets.serve(server.handler, "127.0.0.1", 0, max_size=2048) as listening:
+            port = listening.sockets[0].getsockname()[1]
+            uri = f"ws://127.0.0.1:{port}"
+
+            async with websockets.connect(uri) as ws:
+                await ws.send(json.dumps({"type": "hello", "proto": 1, "device_id": "test", "codecs": ["pcm_s16le"], "sample_rate": 16000}))
+                assert json.loads(await ws.recv()) == {"type": "hello_ack", "proto": 1}
+
+                await ws.send(json.dumps({
+                    "type": "start",
+                    "stream_id": 1,
+                    "codec": "pcm_s16le",
+                    "sample_rate": 16000,
+                    "channels": 1,
+                    "frame_ms": 20,
+                    "prebuffer_ms": 0,
+                    "live_sample_offset": 0,
+                    "t_detect_us": 0,
+                }))
+
+                # Send one audio frame
+                payload = b"\x00\x00" * (PCM_PAYLOAD_LEN // 2)  # silence
+                frame = AudioFrame(CODEC_PCM, FLAG_FIRST | FLAG_LAST, 0, 1, 0, payload)
+                await ws.send(pack(frame))
+
+                await ws.send(json.dumps({"type": "stop", "stream_id": 1, "reason": "test"}))
+
+            # Allow server to process
+            await asyncio.sleep(0.05)
+
+        # Check that the WAV file was created (PCM passthrough still works)
+        received_wav = tmp_path / "stream-1.wav"
+        assert received_wav.exists()
+        with wave.open(str(received_wav), "rb") as wav:
+            assert wav.getnframes() == 320  # one frame
+
+        # Ensure no ASR fields were updated (they should stay at zero/default)
+        # We cannot directly access the stream object after the test, but we can check logs for warnings.
+        # At least we expect a warning about failed ASR worker creation.
+        assert "Failed to create ASR worker" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_two_streams_independent_asr(tmp_path):
+    """Two simultaneous streams should have separate ASR workers."""
+    # Patch ASRWorker before importing/reloading server module
+    with patch("backend.asr.worker.ASRWorker") as mock_worker_class:
+        mock_worker_instance = mock_worker_class.return_value
+        mock_worker_instance.start.return_value = None
+        mock_worker_instance.add_audio.return_value = None
+        mock_worker_instance.get_result.return_value = None
+
+        # Reload the server module to pick up the patched ASRWorker
+        import backend.server
+        importlib.reload(backend.server)
+        from backend.server import VoiceServer
+
+        server = VoiceServer(tmp_path)
+        async with websockets.serve(server.handler, "127.0.0.1", 0, max_size=2048) as listening:
+            port = listening.sockets[0].getsockname()[1]
+            uri = f"ws://127.0.0.1:{port}"
+
+            # Connect two clients simultaneously
+            async with websockets.connect(uri) as ws1, websockets.connect(uri) as ws2:
+                # Hello for both
+                await ws1.send(json.dumps({"type": "hello", "proto": 1, "device_id": "dev1", "codecs": ["pcm_s16le"], "sample_rate": 16000}))
+                assert json.loads(await ws1.recv()) == {"type": "hello_ack", "proto": 1}
+                await ws2.send(json.dumps({"type": "hello", "proto": 1, "device_id": "dev2", "codecs": ["pcm_s16le"], "sample_rate": 16000}))
+                assert json.loads(await ws2.recv()) == {"type": "hello_ack", "proto": 1}
+
+                # Start stream 1
+                await ws1.send(json.dumps({
+                    "type": "start",
+                    "stream_id": 10,
+                    "codec": "pcm_s16le",
+                    "sample_rate": 16000,
+                    "channels": 1,
+                    "frame_ms": 20,
+                    "prebuffer_ms": 0,
+                    "live_sample_offset": 0,
+                    "t_detect_us": 0,
+                }))
+                # Start stream 2
+                await ws2.send(json.dumps({
+                    "type": "start",
+                    "stream_id": 20,
+                    "codec": "pcm_s16le",
+                    "sample_rate": 16000,
+                    "channels": 1,
+                    "frame_ms": 20,
+                    "prebuffer_ms": 0,
+                    "live_sample_offset": 0,
+                    "t_detect_us": 0,
+                }))
+
+                # Send one frame to each stream
+                payload = b"\x00\x00" * (PCM_PAYLOAD_LEN // 2)
+                frame1 = AudioFrame(CODEC_PCM, FLAG_FIRST | FLAG_LAST, 0, 10, 0, payload)
+                frame2 = AudioFrame(CODEC_PCM, FLAG_FIRST | FLAG_LAST, 0, 20, 0, payload)
+                await ws1.send(pack(frame1))
+                await ws2.send(pack(frame2))
+
+                # Stop both streams
+                await ws1.send(json.dumps({"type": "stop", "stream_id": 10, "reason": "test"}))
+                await ws2.send(json.dumps({"type": "stop", "stream_id": 20, "reason": "test"}))
+
+            # Allow processing
+            await asyncio.sleep(0.05)
+
+            # Verify that two distinct ASRWorker instances were created (i.e., the constructor was called twice)
+            assert mock_worker_class.call_count == 2
+            # Ensure each instance's start and add_audio were called
+            assert mock_worker_instance.start.call_count == 2
+            assert mock_worker_instance.add_audio.call_count == 2
+
+        # After the test, reload the module again to restore the original class for other tests
+        importlib.reload(backend.server)
+
+
+@pytest.mark.asyncio
+async def test_normal_single_stream_asr_behavior(tmp_path, caplog):
+    """Single stream should process ASR and update telemetry when worker is functional."""
+    # Set log level to INFO to capture info logs
+    caplog.set_level(logging.INFO)
+    # Patch ASRWorker to return a dummy result on get_result
+    with patch("backend.asr.worker.ASRWorker") as mock_worker_class:
+        mock_worker_instance = mock_worker_class.return_value
+        mock_worker_instance.start.return_value = None
+        mock_worker_instance.add_audio.return_value = None
+        # Simulate a final result with some text
+        from backend.asr.worker import ASRResult
+        dummy_result = ASRResult(text="hello world", is_final=True, confidence=0.9)
+        mock_worker_instance.get_result.return_value = dummy_result
+
+        # Reload the server module to pick up the patched ASRWorker
+        import backend.server
+        importlib.reload(backend.server)
+        from backend.server import VoiceServer
+
+        server = VoiceServer(tmp_path)
+        async with websockets.serve(server.handler, "127.0.0.1", 0, max_size=2048) as listening:
+            port = listening.sockets[0].getsockname()[1]
+            uri = f"ws://127.0.0.1:{port}"
+
+            async with websockets.connect(uri) as ws:
+                await ws.send(json.dumps({"type": "hello", "proto": 1, "device_id": "asr-test", "codecs": ["pcm_s16le"], "sample_rate": 16000}))
+                assert json.loads(await ws.recv()) == {"type": "hello_ack", "proto": 1}
+
+                await ws.send(json.dumps({
+                    "type": "start",
+                    "stream_id": 7,
+                    "codec": "pcm_s16le",
+                    "sample_rate": 16000,
+                    "channels": 1,
+                    "frame_ms": 20,
+                    "prebuffer_ms": 0,
+                    "live_sample_offset": 0,
+                    "t_detect_us": 0,
+                }))
+
+                # Send three audio frames
+                for i in range(3):
+                    payload = bytes([(i + j) % 256 for j in range(PCM_PAYLOAD_LEN)])
+                    frame = AudioFrame(CODEC_PCM, FLAG_FIRST if i == 0 else 0, i, 7, i * SAMPLES_PER_FRAME, payload)
+                    await ws.send(pack(frame))
+
+                await ws.send(json.dumps({"type": "stop", "stream_id": 7, "reason": "test"}))
+
+            # Allow processing
+            await asyncio.sleep(0.05)
+
+        # After the test, reload the module again to restore the original class for other tests
+        importlib.reload(backend.server)
+
+        # Check that the WAV file was created with three frames
+        received_wav = tmp_path / "stream-7.wav"
+        assert received_wav.exists()
+        with wave.open(str(received_wav), "rb") as wav:
+            assert wav.getnframes() == 3 * SAMPLES_PER_FRAME  # three frames
+
+        # We cannot directly inspect the stream object, but we can check that ASR-related logs appear.
+        # Since we patched the worker to return a result, we expect logging of ASR result.
+        assert "ASR result for stream 7" in caplog.text
+        # Also expect that keywords_detected increased (since dummy result has non-empty text)
+        # We could add a custom server to expose stream state, but for simplicity we rely on logs.
+        # The log line includes keywords_detected count; we can verify it's at least 1.
+        import re
+        match = re.search(r"keywords_detected=(\d+)", caplog.text)
+        assert match is not None
+        assert int(match.group(1)) >= 1

@@ -19,6 +19,7 @@ backend/         # Python WebSocket server (M1-M2 implemented)
 tools/           # Simulation and test utilities
   sim_esp32.py   # ESP32 client simulator (M1-M2 implemented)
   compare.py     # WAV comparison utility
+  laptop_client.py   # Laptop microphone client for end-to-end validation (development tool)
 
 tests/           # Test suite
   test_roundtrip.py   # M1-M2 WAV round-trip tests
@@ -45,7 +46,7 @@ docs/            # Additional documentation (if any)
   - `tests/test_roundtrip.py`: End-to-end WAV round-trip validation
 
 ## Implemented vs Planned Components
-**Implemented (M1-M2)**:
+**Implemented (M1-M3)**:
 - ✅ Frozen v1.0 wire protocol (PCM only)
 - ✅ WebSocket binary frames + JSON control messages
 - ✅ Stream lifecycle (hello → hello_ack → start → frames → stop)
@@ -53,16 +54,18 @@ docs/            # Additional documentation (if any)
 - ✅ Stream finalization to WAV (zero-padded to frame boundary)
 - ✅ Simultaneous multi-client support
 - ✅ Malformed frame defensive handling
-- ✅ ASR integration hooks (M2: worker threads, partial/final text)
+- ✅ ASR integration (M3: per-stream non-blocking worker threads, partial/final text, telemetry)
 
-**Planned (M3+)**:
-- 🔲 ESP32-S3 I2S microphone input (M3)
-- 🔲 Persistent PCM connection on ESP32-S3 (M3)
-- 🔲 100+ trial latency harness with p50/p95/p99 (M4)
-- 🔲 IMA ADPCM conformance and live transport (M5)
-- 🔲 Timeouts, disconnects, backpressure, condition matrices (M6)
-- 🔲 ML keyword model and MFCC computation (M3+)
-- 🔲 Backend ASR integration (M3+)
+**Planned (M4+)**:
+- 🔲 ESP32-S3 I2S microphone input (M4)
+- 🔲 Local keyword spotting (KWS) on ESP32-S3 (M4)
+- 🔲 Persistent PCM connection on ESP32-S3 (M4)
+- 🔲 Pre-buffer + live audio streaming after KWS detection (M4)
+- 🔲 100+ trial latency harness with p50/p95/p99 (M5)
+- 🔲 IMA ADPCM conformance and live transport (M6)
+- 🔲 Timeouts, disconnects, backpressure, condition matrices (M7)
+- 🔲 ML keyword model and MFCC computation (M4+)
+- 🔲 Backend ASR integration (M3 implemented)
 
 **Explicitly Out of Scope Unless Measurements Force Reconsideration**:
 - Opus, μ-law codecs (PCM and IMA ADPCM only unless proven necessary)

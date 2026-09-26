@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import json
 import queue
-import threading
+import urllib.request
+import zipfile
 from dataclasses import dataclass
+from pathlib import Path
+import threading
 from typing import Optional
 
 import vosk
@@ -72,6 +75,56 @@ class ASRWorker:
         except queue.Empty:
             return None
 
+    def _ensure_model_loaded(self) -> None:
+        """Ensure Vosk model is loaded, downloading and extracting if necessary."""
+        if self.model is not None or self._model_loading_attempted:
+            return
+        self._model_loading_attempted = True
+        try:
+            # Determine model directory path
+            if self.model_path is None:
+                model_dir = self._get_default_model_path()
+            else:
+                model_dir = Path(self.model_path)
+            # Ensure the model directory exists (extract if needed)
+            if not model_dir.exists():
+                self._download_and_extract_model(model_dir)
+            # Load the model
+            self.model = vosk.Model(str(model_dir))
+            self.recognizer = vosk.KaldiRecognizer(self.model, SAMPLE_RATE)
+            self.recognizer.SetWords(True)
+        except Exception as e:
+            # Log error but keep worker running (without model)
+            print(f"ASR Worker failed to load model: {e}")
+            self.model = None
+            self.recognizer = None
+
+    def _get_default_model_path(self) -> Path:
+        """Return the path to the default Vosk small English model directory."""
+        local_model = Path("vosk-model-small-en-us-0.15")
+        if local_model.is_dir():
+            return local_model
+        cache_dir = Path.home() / ".cache" / "vosk"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / "vosk-model-small-en-us-0.15"
+
+    def _download_and_extract_model(self, model_dir: Path) -> None:
+        """Download and extract the Vosk small English model to the given directory."""
+        model_url = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
+        zip_path = model_dir.with_suffix('.zip')
+        try:
+            if not zip_path.exists():
+                print(f"Downloading Vosk model from {model_url}...")
+                urllib.request.urlretrieve(model_url, zip_path)
+                print("Download complete. Extracting...")
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(path=model_dir.parent)
+            zip_path.unlink()
+            print(f"Vosk model extracted to {model_dir}")
+        except Exception as e:
+            print(f"Failed to download or extract Vosk model: {e}")
+            raise
+
     def _worker_loop(self) -> None:
         """Main worker loop running in separate thread."""
         while self.running:
@@ -80,28 +133,8 @@ class ASRWorker:
                 audio_data = self.audio_queue.get(timeout=0.1)
 
                 # Load Vosk model if not already loaded (and not attempted)
-                if self.model is None and not self._model_loading_attempted:
-                    self._model_loading_attempted = True
-                    try:
-                        if self.model_path is None:
-                            # For now, we'll use a simple approach - in real implementation,
-                            # this would download/load a proper model
-                            try:
-                                self.model = vosk.Model(lang="en-us")
-                            except Exception:
-                                # Fallback: create a minimal model for testing
-                                # In production, this would be a proper model download
-                                self.model = vosk.Model(model_name="vosk-model-small-en-us-0.15")
-                        else:
-                            self.model = vosk.Model(self.model_path)
-
-                        self.recognizer = vosk.KaldiRecognizer(self.model, SAMPLE_RATE)
-                        self.recognizer.SetWords(True)
-                    except Exception as e:
-                        # Log error but keep worker running (without model)
-                        print(f"ASR Worker failed to load model: {e}")
-                        self.model = None
-                        self.recognizer = None
+                if self.model is None:
+                    self._ensure_model_loaded()
 
                 # If we still don't have a model, discard audio data and continue
                 if self.model is None:
