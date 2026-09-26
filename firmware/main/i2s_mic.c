@@ -8,6 +8,7 @@
 
 #ifdef ESP_PLATFORM
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
 #include "driver/i2s_std.h"
 
 static const char *TAG = "i2s_mic";
@@ -28,11 +29,18 @@ bool i2s_mic_init(const i2s_mic_config_t *config) {
         return false;
     }
 
+    i2s_std_slot_config_t slot_cfg;
+    if (s_is_32bit_slot) {
+        i2s_std_slot_config_t sc = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
+        slot_cfg = sc;
+    } else {
+        i2s_std_slot_config_t sc = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+        slot_cfg = sc;
+    }
+
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
-        .slot_cfg = s_is_32bit_slot ? 
-            I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO) :
-            I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .slot_cfg = slot_cfg,
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = (gpio_num_t)config->sck_gpio,

@@ -31,6 +31,16 @@ from .protocol import (
 )
 from .asr.worker import ASRResult, ASRWorker
 
+# Vosk import for shared model resources
+try:
+    import vosk
+except ImportError:
+    vosk = None
+
+# Debug counters for Vosk model loading
+_vosk_model_construction_count = 0
+_vosk_recognizer_construction_count = 0
+
 LOG = logging.getLogger(__name__)
 MAX_STREAM_SECONDS = 10
 MAX_GAP_SAMPLES = SAMPLE_RATE * 2
@@ -58,13 +68,19 @@ class Stream:
     # Telemetry
     keywords_detected: int = 0
     asr_processing_time_ms: float = 0.0
+    # Reference to parent server for shared resources
+    _server: Optional[Any] = None
 
     def _ensure_asr_worker(self) -> None:
         """Create and start the ASR worker for this stream if not already started."""
         if self.asr_thread_started:
             return
         try:
-            self.asr_worker = ASRWorker()
+            # Use shared Vosk model if available
+            if self._server and self._server._shared_asr_model is not None:
+                self.asr_worker = ASRWorker(model=self._server._shared_asr_model)
+            else:
+                self.asr_worker = ASRWorker()
             self.asr_worker.start()
             self.asr_thread_started = True
         except Exception as e:
@@ -85,6 +101,36 @@ class VoiceServer:
         self.output_dir = output_dir
         self.inactivity_s = inactivity_s
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Shared ASR model resource - loaded once per VoiceServer
+        self._shared_asr_model: Optional[vosk.Model] = None
+        self._shared_asr_recognizer: Optional[vosk.KaldiRecognizer] = None
+        self._initialize_shared_asr_resources()
+
+    def _initialize_shared_asr_resources(self) -> None:
+        """Initialize shared Vosk model resources for all streams in this server."""
+        if vosk is None:
+            LOG.warning("Vosk not available, ASR functionality disabled")
+            return
+
+        try:
+            # Determine model directory path (same logic as ASRWorker)
+            model_dir = Path.home() / ".cache" / "vosk" / "vosk-model-small-en-us-0.15"
+            if not model_dir.is_dir():
+                # Try local path
+                model_dir = Path("vosk-model-small-en-us-0.15")
+                if not model_dir.is_dir():
+                    LOG.warning("Vosk model not found, ASR functionality disabled")
+                    return
+
+            # Load the model and recognizer once
+            self._shared_asr_model = vosk.Model(str(model_dir))
+            self._shared_asr_recognizer = vosk.KaldiRecognizer(self._shared_asr_model, SAMPLE_RATE)
+            self._shared_asr_recognizer.SetWords(True)
+            LOG.info("Shared Vosk model resources initialized")
+        except Exception as e:
+            LOG.warning("Failed to initialize shared Vosk resources: %s", e)
+            self._shared_asr_model = None
+            self._shared_asr_recognizer = None
 
     async def handler(self, ws: ServerConnection) -> None:
         hello: dict[str, Any] | None = None
@@ -158,7 +204,9 @@ class VoiceServer:
             if stream_id in streams:
                 await ws.send(json.dumps({"type": "error", "code": "DUPLICATE_STREAM"}))
                 return hello
-            streams[stream_id] = Stream(stream_id, hello["device_id"])
+            stream = Stream(stream_id, hello["device_id"])
+            stream._server = self  # Set server reference for shared resources
+            streams[stream_id] = stream
             LOG.info("start stream=%d device=%s", stream_id, hello["device_id"])
             return hello
         if kind == "stop":
@@ -190,12 +238,22 @@ class VoiceServer:
             stream.bad += 1
             LOG.warning("first frame missing FIRST flag stream=%d", frame.stream_id)
             return
+        max_pcm_bytes = MAX_STREAM_SECONDS * SAMPLE_RATE * 2
+        if len(stream.pcm) + PCM_PAYLOAD_LEN > max_pcm_bytes:
+            LOG.warning("max duration reached stream=%d", stream.stream_id)
+            self.finalize(stream, "max_duration")
+            del streams[stream.stream_id]
+            return
+
         if frame.sample_offset != stream.expected_offset:
             stream.gaps += 1
             if stream.expected_offset < frame.sample_offset <= stream.expected_offset + MAX_GAP_SAMPLES:
                 missing = frame.sample_offset - stream.expected_offset
-                stream.pcm.extend(b"\0" * (missing * 2))
-                LOG.warning("inserted %d silence samples stream=%d", missing, frame.stream_id)
+                max_missing_samples = max(0, (max_pcm_bytes - len(stream.pcm) - PCM_PAYLOAD_LEN) // 2)
+                inserted = min(missing, max_missing_samples)
+                if inserted > 0:
+                    stream.pcm.extend(b"\0" * (inserted * 2))
+                    LOG.warning("inserted %d silence samples stream=%d", inserted, frame.stream_id)
             else:
                 stream.bad += 1
                 LOG.warning(
@@ -205,8 +263,11 @@ class VoiceServer:
                     stream.stream_id,
                 )
                 return
-        if len(stream.pcm) + PCM_PAYLOAD_LEN > MAX_STREAM_SECONDS * SAMPLE_RATE * 2:
+
+        if len(stream.pcm) + PCM_PAYLOAD_LEN > max_pcm_bytes:
             LOG.warning("max duration reached stream=%d", stream.stream_id)
+            self.finalize(stream, "max_duration")
+            del streams[stream.stream_id]
             return
         if stream.first_frame_ns is None:
             stream.first_frame_ns = time.perf_counter_ns()

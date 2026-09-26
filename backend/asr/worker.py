@@ -32,21 +32,27 @@ class ASRResult:
 class ASRWorker:
     """Worker thread for Vosk ASR processing."""
 
-    def __init__(self, model_path: Optional[str] = None):
+    def __init__(self, model_path: Optional[str] = None, model: Optional[vosk.Model] = None):
         """
         Initialize ASR worker.
 
         Args:
             model_path: Path to Vosk model. If None, uses small English model.
+            model: Pre-loaded Vosk model. If provided, skips model loading.
         """
         self.model_path = model_path
-        self.model = None
+        # If a pre-loaded model is provided, use it; otherwise load later
+        self.model = model
         self.recognizer = None
+        if self.model is not None:
+            # Initialize recognizer with pre-loaded model
+            self.recognizer = vosk.KaldiRecognizer(self.model, SAMPLE_RATE)
+            self.recognizer.SetWords(True)
         self.audio_queue = queue.Queue()
         self.result_queue = queue.Queue()
         self.worker_thread = None
         self.running = False
-        self._model_loading_attempted = False
+        self._model_loading_attempted = model is not None  # Skip loading if model provided
 
     def start(self) -> None:
         """Start the ASR worker thread."""
@@ -135,6 +141,11 @@ class ASRWorker:
                 # Load Vosk model if not already loaded (and not attempted)
                 if self.model is None:
                     self._ensure_model_loaded()
+
+                # Ensure recognizer is created if we have a model but no recognizer
+                if self.model is not None and self.recognizer is None:
+                    self.recognizer = vosk.KaldiRecognizer(self.model, SAMPLE_RATE)
+                    self.recognizer.SetWords(True)
 
                 # If we still don't have a model, discard audio data and continue
                 if self.model is None:

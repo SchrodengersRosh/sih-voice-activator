@@ -36,6 +36,7 @@ extern "C" {
 #define PREBUFFER_MS            800
 #define PREBUFFER_FRAMES        (PREBUFFER_MS / AUDIO_FRAME_MS) // 40 frames
 #define PREBUFFER_SAMPLES       (PREBUFFER_FRAMES * AUDIO_SAMPLES_PER_FRAME) // 12800 samples
+#define PREBUFFER_BYTES         (PREBUFFER_FRAMES * AUDIO_PCM_PAYLOAD_LEN)   // 25600 bytes
 
 #pragma pack(push, 1)
 typedef struct {

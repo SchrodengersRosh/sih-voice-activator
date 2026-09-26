@@ -117,3 +117,81 @@ async def test_localhost_start_to_first_frame_latency(tmp_path):
     stream_id, latency_ms = latencies[0]
     assert latency_ms < 5.0, f"Latency {latency_ms:.3f} ms exceeds target of 5 ms"
 
+
+@pytest.mark.asyncio
+async def test_max_duration_stream_finalization(tmp_path):
+    """
+    Regression test for physical ESP32 streaming past 10s max duration limit:
+    1. Send 500 frames (10 seconds, 160,000 samples).
+    2. Continue sending 20 extra frames past max duration (exact physical failure mode).
+    3. Verify stream is cleanly finalized with reason='max_duration'.
+    4. Verify 0 gaps and 0 bad frames are recorded (no spurious silence insertion).
+    5. Verify WAV file has exactly 160,000 samples.
+    """
+    server = VoiceServer(tmp_path)
+    finalized = []
+    orig_finalize = server.finalize
+
+    def tracked_finalize(stream, reason):
+        finalized.append((stream.stream_id, reason, stream.frames, stream.gaps, stream.bad))
+        return orig_finalize(stream, reason)
+
+    server.finalize = tracked_finalize
+
+    async with serve(server.handler, "127.0.0.1", 0) as listening:
+        port = listening.sockets[0].getsockname()[1]
+        uri = f"ws://127.0.0.1:{port}"
+        async with websockets.connect(uri) as ws:
+            await ws.send(json.dumps({
+                "type": "hello",
+                "proto": 1,
+                "device_id": "max-dur-dev",
+                "codecs": ["pcm_s16le"],
+                "sample_rate": 16000,
+            }))
+            assert json.loads(await ws.recv()) == {"type": "hello_ack", "proto": 1}
+
+            await ws.send(json.dumps({
+                "type": "start",
+                "stream_id": 1,
+                "codec": "pcm_s16le",
+                "sample_rate": 16000,
+                "channels": 1,
+                "frame_ms": 20,
+                "prebuffer_ms": 0,
+                "live_sample_offset": 0,
+                "t_detect_us": 0,
+            }))
+
+            # Send 500 frames (exactly 10 seconds) + 20 overflow frames
+            total_frames_sent = 520
+            payload = b"\x01\x00" * 320
+            for seq in range(total_frames_sent):
+                flags = FLAG_FIRST if seq == 0 else 0
+                frame = AudioFrame(
+                    codec=CODEC_PCM,
+                    flags=flags,
+                    seq=seq,
+                    stream_id=1,
+                    sample_offset=seq * 320,
+                    payload=payload,
+                )
+                await ws.send(pack(frame))
+
+            # Send stop message (should be gracefully handled for finalized stream)
+            await ws.send(json.dumps({"type": "stop", "stream_id": 1, "reason": "test"}))
+            await asyncio.sleep(0.05)
+
+    assert len(finalized) == 1, f"Expected 1 finalized stream, got {len(finalized)}"
+    stream_id, reason, frames, gaps, bad = finalized[0]
+    assert stream_id == 1
+    assert reason == "max_duration", f"Expected reason 'max_duration', got '{reason}'"
+    assert frames == 500, f"Expected 500 frames, got {frames}"
+    assert gaps == 0, f"Expected 0 gaps, got {gaps}"
+    assert bad == 0, f"Expected 0 bad frames, got {bad}"
+
+    wav_file = tmp_path / "stream-1.wav"
+    assert wav_file.exists()
+    with wave.open(str(wav_file), "rb") as w:
+        assert w.getnframes() == 160000, f"Expected 160,000 samples, got {w.getnframes()}"
+

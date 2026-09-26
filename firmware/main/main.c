@@ -26,15 +26,27 @@
 static const char *TAG = "sih_edge";
 
 #ifndef CONFIG_SIH_WIFI_SSID
-#define CONFIG_SIH_WIFI_SSID "myssid"
+#define CONFIG_SIH_WIFI_SSID "Nullpointer-2.4G"
 #endif
 
 #ifndef CONFIG_SIH_WIFI_PASSWORD
-#define CONFIG_SIH_WIFI_PASSWORD "mypassword"
+#define CONFIG_SIH_WIFI_PASSWORD ""
+#endif
+
+#ifndef CONFIG_SIH_SERVER_HOST
+#define CONFIG_SIH_SERVER_HOST "192.168.1.8"
+#endif
+
+#ifndef CONFIG_SIH_SERVER_PORT
+#define CONFIG_SIH_SERVER_PORT 8765
+#endif
+
+#ifndef CONFIG_SIH_SERVER_PATH
+#define CONFIG_SIH_SERVER_PATH "/v1/stream"
 #endif
 
 #ifndef CONFIG_SIH_SERVER_URI
-#define CONFIG_SIH_SERVER_URI "ws://192.168.1.100:8765"
+#define CONFIG_SIH_SERVER_URI ""
 #endif
 
 #ifndef CONFIG_SIH_DEVICE_ID
@@ -186,8 +198,18 @@ void app_main(void) {
     }
 
     // 2. Initialize Persistent WebSocket Connection
+    char server_uri[160];
+    if (strlen(CONFIG_SIH_SERVER_URI) > 0) {
+        strncpy(server_uri, CONFIG_SIH_SERVER_URI, sizeof(server_uri) - 1);
+        server_uri[sizeof(server_uri) - 1] = '\0';
+    } else {
+        snprintf(server_uri, sizeof(server_uri), "ws://%s:%d%s",
+                 CONFIG_SIH_SERVER_HOST, CONFIG_SIH_SERVER_PORT, CONFIG_SIH_SERVER_PATH);
+    }
+    ESP_LOGI(TAG, "Connecting to backend WebSocket URI: %s", server_uri);
+
     ws_client_config_t ws_cfg = {
-        .uri = CONFIG_SIH_SERVER_URI,
+        .uri = server_uri,
         .device_id = CONFIG_SIH_DEVICE_ID,
     };
     ws_client_init(&ws_cfg);

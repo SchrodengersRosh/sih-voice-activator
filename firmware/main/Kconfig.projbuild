@@ -3,23 +3,43 @@ menu "SIH Voice Activator Configuration"
     menu "Wi-Fi Configuration"
         config SIH_WIFI_SSID
             string "Wi-Fi SSID"
-            default "myssid"
+            default "Nullpointer-2.4G"
             help
                 SSID of the Wi-Fi network to connect to.
 
         config SIH_WIFI_PASSWORD
             string "Wi-Fi Password"
-            default "mypassword"
+            default ""
             help
                 Password of the Wi-Fi network.
     endmenu
 
     menu "Backend Server Configuration"
-        config SIH_SERVER_URI
-            string "Backend WebSocket Server URI"
-            default "ws://192.168.1.100:8765"
+        config SIH_SERVER_HOST
+            string "Backend Server Host / IP"
+            default "192.168.1.8"
             help
-                WebSocket URI of the streaming ASR backend server.
+                IP address or hostname of the Mac/backend running Python VoiceServer.
+
+        config SIH_SERVER_PORT
+            int "Backend Server Port"
+            default 8765
+            range 1 65535
+            help
+                Port of the backend WebSocket server (default: 8765).
+
+        config SIH_SERVER_PATH
+            string "Backend WebSocket Endpoint Path"
+            default "/v1/stream"
+            help
+                Endpoint path for WebSocket streaming (frozen protocol: /v1/stream).
+
+        config SIH_SERVER_URI
+            string "Backend WebSocket Server Full URI (Optional Override)"
+            default ""
+            help
+                Optional full URI override (e.g. ws://192.168.1.8:8765/v1/stream).
+                If left empty, URI is constructed from SIH_SERVER_HOST, SIH_SERVER_PORT, and SIH_SERVER_PATH.
 
         config SIH_DEVICE_ID
             string "Device ID"

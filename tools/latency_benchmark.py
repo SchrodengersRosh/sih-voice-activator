@@ -60,12 +60,13 @@ class M5LatencyBenchmark:
         self.latencies: List[float] = []  # Successful T3-T0 latencies in ms
         self.failures: List[str] = []     # Failure descriptions
 
-    async def run_single_trial(self, trial_id: int) -> Optional[float]:
+    async def run_single_trial(self, trial_id: int, server: VoiceServer) -> Optional[float]:
         """
         Run a single T3-T0 latency trial.
 
         Args:
             trial_id: Identifier for this trial
+            server: Persistent VoiceServer instance to use for all trials
 
         Returns:
             T3-T0 latency in milliseconds if successful, None if failed
@@ -74,8 +75,8 @@ class M5LatencyBenchmark:
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmp_path = Path(tmpdir)
 
-                # Create backend server
-                server = VoiceServer(tmp_path)
+                # Use the persistent server (passed in)
+                # Note: We don't create a new server per trial anymore
 
                 # Track T3 (first frame receive time)
                 t3_timestamp_ns: Optional[int] = None
@@ -219,37 +220,43 @@ class M5LatencyBenchmark:
         LOG.info("  Measurement environment: HOST/SIMULATOR")
         LOG.info("  Metric: T3-T0 (T3 = first backend frame, T0 = keyword audio end)")
 
-        # Run warm-up trials (excluded from statistics)
-        LOG.info("Running warm-up trials...")
-        for i in range(self.warmup_trials):
-            try:
-                latency = await self.run_single_trial(i)
-                if latency is not None:
-                    LOG.debug(f"Warm-up trial {i}: {latency:.3f} ms")
-                else:
-                    LOG.warning(f"Warm-up trial {i} failed")
-            except Exception as e:
-                LOG.warning(f"Warm-up trial {i} failed: {e}")
+        # Create a persistent VoiceServer for the entire benchmark run
+        # Use a temporary directory for the server's output (will be cleaned up after benchmark)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            server = VoiceServer(tmp_path)
 
-        # Run measured trials
-        LOG.info("Running measured trials...")
-        self.latencies = []
-        self.failures = []
+            # Run warm-up trials (excluded from statistics)
+            LOG.info("Running warm-up trials...")
+            for i in range(self.warmup_trials):
+                try:
+                    latency = await self.run_single_trial(i, server)
+                    if latency is not None:
+                        LOG.debug(f"Warm-up trial {i}: {latency:.3f} ms")
+                    else:
+                        LOG.warning(f"Warm-up trial {i} failed")
+                except Exception as e:
+                    LOG.warning(f"Warm-up trial {i} failed: {e}")
 
-        for i in range(self.measured_trials):
-            trial_num = self.warmup_trials + i
-            try:
-                latency = await self.run_single_trial(trial_num)
-                if latency is not None:
-                    self.latencies.append(latency)
-                    if (i + 1) % 10 == 0 or i < 5:  # Log first few and every 10th
-                        LOG.info(f"Trial {trial_num}: {latency:.3f} ms")
-                else:
-                    self.failures.append(f"Trial {trial_num}: Returned None latency")
-                    LOG.warning(f"Trial {trial_num}: Returned None latency")
-            except Exception as e:
-                self.failures.append(f"Trial {trial_num}: {str(e)}")
-                LOG.warning(f"Trial {trial_num} failed: {e}")
+            # Run measured trials
+            LOG.info("Running measured trials...")
+            self.latencies = []
+            self.failures = []
+
+            for i in range(self.measured_trials):
+                trial_num = self.warmup_trials + i
+                try:
+                    latency = await self.run_single_trial(trial_num, server)
+                    if latency is not None:
+                        self.latencies.append(latency)
+                        if (i + 1) % 10 == 0 or i < 5:  # Log first few and every 10th
+                            LOG.info(f"Trial {trial_num}: {latency:.3f} ms")
+                    else:
+                        self.failures.append(f"Trial {trial_num}: Returned None latency")
+                        LOG.warning(f"Trial {trial_num}: Returned None latency")
+                except Exception as e:
+                    self.failures.append(f"Trial {trial_num}: {str(e)}")
+                    LOG.warning(f"Trial {trial_num} failed: {e}")
 
         # Calculate statistics
         if not self.latencies:
