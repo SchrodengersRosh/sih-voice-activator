@@ -32,6 +32,9 @@ class ASRResult:
 class ASRWorker:
     """Worker thread for Vosk ASR processing."""
 
+    # Internal sentinel to signal finish
+    _FINISH = object()
+
     def __init__(self, model_path: Optional[str] = None, model: Optional[vosk.Model] = None):
         """
         Initialize ASR worker.
@@ -52,6 +55,8 @@ class ASRWorker:
         self.result_queue = queue.Queue()
         self.worker_thread = None
         self.running = False
+        self._finished = False
+        self._final_result = None
         self._model_loading_attempted = model is not None  # Skip loading if model provided
 
     def start(self) -> None:
@@ -71,13 +76,46 @@ class ASRWorker:
 
     def add_audio(self, audio_data: bytes) -> None:
         """Add audio data to be processed."""
-        if self.running:
+        if self.running and not self._finished:
             self.audio_queue.put(audio_data)
 
     def get_result(self, timeout: float = 0.1) -> Optional[ASRResult]:
         """Get ASR result if available."""
         try:
             return self.result_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def finish(self) -> Optional[ASRResult]:
+        """
+        Finish processing and return final ASR result.
+
+        Returns:
+            ASRResult with final transcription, or None if worker not started,
+            already stopped, or already finished.
+        """
+        # Return None if worker was never started
+        if not self.running:
+            return None
+
+        # Return None if finish() has already been called
+        if self._finished:
+            return None
+
+        # Mark as finished to prevent further add_audio
+        self._finished = True
+
+        # Enqueue the finish sentinel
+        self.audio_queue.put(self._FINISH)
+
+        # Wait for worker thread to finish processing
+        if self.worker_thread:
+            self.worker_thread.join(timeout=5.0)
+            self.worker_thread = None
+
+        # Return the final result if available
+        try:
+            return self.result_queue.get_nowait()
         except queue.Empty:
             return None
 
@@ -138,6 +176,25 @@ class ASRWorker:
                 # Get audio data with timeout
                 audio_data = self.audio_queue.get(timeout=0.1)
 
+                # Check for finish sentinel
+                if audio_data is self._FINISH:
+                    # Drain is complete, finalize recognizer and emit final result
+                    if self.model is not None and self.recognizer is not None:
+                        # Call FinalResult to get the final transcription
+                        result_json = self.recognizer.FinalResult()
+                        result = json.loads(result_json)
+                        asr_result = ASRResult(
+                            text=result.get("text", ""),
+                            is_final=True,
+                            confidence=result.get("confidence", 0.0)
+                        )
+                        try:
+                            self.result_queue.put_nowait(asr_result)
+                        except queue.Full:
+                            pass
+                    # Break out of the loop to terminate the worker
+                    break
+
                 # Load Vosk model if not already loaded (and not attempted)
                 if self.model is None:
                     self._ensure_model_loaded()
@@ -171,12 +228,13 @@ class ASRWorker:
                         confidence=0.0
                     )
 
-                # Put result in queue (non-blocking)
-                try:
-                    self.result_queue.put_nowait(asr_result)
-                except queue.Full:
-                    # Drop result if queue is full
-                    pass
+                # Put result in queue only if not finished (to avoid queuing partial results during finish)
+                if not self._finished:
+                    try:
+                        self.result_queue.put_nowait(asr_result)
+                    except queue.Full:
+                        # Drop result if queue is full
+                        pass
 
             except queue.Empty:
                 continue
@@ -184,3 +242,5 @@ class ASRWorker:
                 # Log error but keep worker running
                 print(f"ASR Worker error: {e}")
                 continue
+        # Set running to false to ensure cleanup
+        self.running = False
