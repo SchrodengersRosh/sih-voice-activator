@@ -8,6 +8,7 @@ received/
 .DS_Store
 *.egg-info/
 vosk-model-*/
+piper_models/
 firmware/sdkconfig
 firmware/build/
 firmware/dependencies.lock

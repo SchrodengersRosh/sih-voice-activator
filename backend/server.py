@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import struct
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,16 +27,20 @@ from .protocol import (
     SAMPLES_PER_FRAME,
     AudioFrame,
     ProtocolError,
+    pack,
     unpack,
     SAMPLE_RATE,
 )
-from .asr.worker import ASRResult, ASRWorker
-
 # Vosk import for shared model resources
 try:
     import vosk
 except ImportError:
     vosk = None
+
+from .asr.worker import ASRResult, ASRWorker
+from .llm.provider import LLMProvider
+from .llm.ollama_provider import OllamaProvider
+from .tts.provider import TTSProvider, get_default_tts_provider
 
 # Debug counters for Vosk model loading
 _vosk_model_construction_count = 0
@@ -44,6 +49,113 @@ _vosk_recognizer_construction_count = 0
 LOG = logging.getLogger(__name__)
 MAX_STREAM_SECONDS = 10
 MAX_GAP_SAMPLES = SAMPLE_RATE * 2
+
+# Endpointing constants
+ENDPOINT_SILENCE_MS = 650  # Trailing silence to trigger endpointing
+ENDPOINT_SILENCE_FRAMES = int((ENDPOINT_SILENCE_MS / 1000) * SAMPLE_RATE / SAMPLES_PER_FRAME)  # Convert ms to frames
+ENERGY_THRESHOLD = 300     # RMS threshold for speech detection (empirical value)
+
+
+class EndpointDetector:
+    """Detects endpoint of speech based on trailing silence in PCM audio."""
+
+    def __init__(self, silence_frames: int = ENDPOINT_SILENCE_FRAMES, energy_threshold: int = ENERGY_THRESHOLD):
+        self.silence_frames = silence_frames
+        self.energy_threshold = energy_threshold
+        self.reset()
+
+    def reset(self):
+        """Reset the detector to initial state."""
+        self.silence_frame_count = 0
+        self.speech_active = False  # Track if we've seen significant audio
+        self.endpoint_triggered = False
+
+    def process_frame(self, payload: bytes) -> bool:
+        """
+        Process a PCM audio frame and return True if endpoint is detected.
+
+        Args:
+            payload: PCM audio frame bytes (16-bit signed little-endian)
+
+        Returns:
+            True if endpoint detected (trailing silence threshold reached)
+        """
+        # Calculate RMS energy of the frame
+        energy = self._calculate_rms(payload)
+
+        # Check if frame contains significant audio (speech)
+        is_speech = energy > self.energy_threshold
+
+        if is_speech:
+            # Reset silence counter when speech is detected
+            self.silence_frame_count = 0
+            self.speech_active = True
+        else:
+            # Increment silence counter
+            self.silence_frame_count += 1
+
+        # Check for endpoint: trailing silence after speech activity
+        if self.speech_active and not self.endpoint_triggered:
+            if self.silence_frame_count >= self.silence_frames:
+                self.endpoint_triggered = True
+                return True
+
+        return False
+
+    def _calculate_rms(self, payload: bytes) -> float:
+        """
+        Calculate RMS (Root Mean Square) energy of 16-bit PCM audio.
+
+        Args:
+            payload: PCM audio frame bytes (16-bit signed little-endian)
+
+        Returns:
+            RMS energy value
+        """
+        if len(payload) < 2:
+            return 0.0
+
+        num_samples = len(payload) // 2
+        samples = struct.unpack(f"<{num_samples}h", payload[: num_samples * 2])
+        if not samples:
+            return 0.0
+
+        sum_squares = sum(s * s for s in samples)
+        rms = (sum_squares / len(samples)) ** 0.5
+        return rms
+
+    def is_endpoint_triggered(self) -> bool:
+        """Check if endpoint has been triggered."""
+        return self.endpoint_triggered
+
+
+class PCMFrameBuffer:
+    """Buffers arbitrary PCM byte chunks and emits fixed 640-byte (20 ms @ 16 kHz mono s16le) frames."""
+
+    FRAME_BYTES = PCM_PAYLOAD_LEN  # 640 bytes
+
+    def __init__(self, frame_bytes: int = PCM_PAYLOAD_LEN) -> None:
+        self.frame_bytes = frame_bytes
+        self.buffer = bytearray()
+
+    def feed(self, pcm_bytes: bytes) -> list[bytes]:
+        """
+        Accumulate incoming PCM bytes and extract all complete 640-byte frames in order.
+        Any incomplete trailing bytes remain in the per-stream buffer for subsequent payloads.
+        """
+        if not pcm_bytes:
+            return []
+        self.buffer.extend(pcm_bytes)
+        frames: list[bytes] = []
+        while len(self.buffer) >= self.frame_bytes:
+            frames.append(bytes(self.buffer[:self.frame_bytes]))
+            del self.buffer[:self.frame_bytes]
+        return frames
+
+    @property
+    def remaining_bytes(self) -> int:
+        """Number of leftover unaligned bytes currently buffered."""
+        return len(self.buffer)
 
 
 @dataclass(slots=True)
@@ -58,16 +170,28 @@ class Stream:
     started_ns: int = field(default_factory=time.perf_counter_ns)
     first_frame_ns: int | None = None
     # ASR integration
-    asr_worker: Optional[ASRWorker] = None
+    asr_worker: Optional['ASRWorker'] = None
     asr_thread_started: bool = False
     last_asr_result: Optional[ASRResult] = None
     asr_result_count: int = 0
     partial_result_count: int = 0
     final_result_count: int = 0
     last_partial_text: str = ""
-    # Telemetry
+    accumulated_text: list[str] = field(default_factory=list)
+    asr_frame_buffer: 'PCMFrameBuffer' = field(default_factory=PCMFrameBuffer)
+    # Endpointing & finalization tracking
+    endpoint_detector: Optional['EndpointDetector'] = None
+    endpoint_triggered: bool = False
+    finalizing: bool = False
+    finalized: bool = False
+    processing_response: bool = False
+    # Connection reference for downlink playback
+    ws: Optional[ServerConnection] = None
+    # Telemetry & LLM/TTS
     keywords_detected: int = 0
     asr_processing_time_ms: float = 0.0
+    last_llm_response: Optional[str] = None
+    last_llm_telemetry: Optional[Any] = None
     # Reference to parent server for shared resources
     _server: Optional[Any] = None
 
@@ -97,7 +221,14 @@ class Stream:
 
 
 class VoiceServer:
-    def __init__(self, output_dir: Path, *, inactivity_s: float = 1.5) -> None:
+    def __init__(
+        self,
+        output_dir: Path,
+        *,
+        inactivity_s: float = 1.5,
+        llm_provider: Optional[LLMProvider] = None,
+        tts_provider: Optional[TTSProvider] = None,
+    ) -> None:
         self.output_dir = output_dir
         self.inactivity_s = inactivity_s
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -105,6 +236,9 @@ class VoiceServer:
         self._shared_asr_model: Optional[vosk.Model] = None
         self._shared_asr_recognizer: Optional[vosk.KaldiRecognizer] = None
         self._initialize_shared_asr_resources()
+        self._llm_provider = llm_provider or OllamaProvider(model="qwen3:8b", think=False)
+        self._tts_provider = tts_provider or get_default_tts_provider()
+        self._next_audio_id = 42
 
     def _initialize_shared_asr_resources(self) -> None:
         """Initialize shared Vosk model resources for all streams in this server."""
@@ -206,16 +340,28 @@ class VoiceServer:
                 return hello
             stream = Stream(stream_id, hello["device_id"])
             stream._server = self  # Set server reference for shared resources
+            stream.ws = ws
             streams[stream_id] = stream
             LOG.info("start stream=%d device=%s", stream_id, hello["device_id"])
             return hello
         if kind == "stop":
             stream_id = msg.get("stream_id")
-            stream = streams.pop(stream_id, None)
+            stream = streams.get(stream_id)
             if stream is None:
                 LOG.warning("stop for unknown stream=%r", stream_id)
+            elif stream.finalized or stream.finalizing:
+                LOG.info("stream %d already finalizing or finalized; ignoring stop", stream_id)
+                streams.pop(stream_id, None)
             else:
-                self.finalize(stream, str(msg.get("reason", "stop")))
+                stream.finalizing = True
+                asyncio.create_task(
+                    self._finish_asr_worker_and_finalize(
+                        stream, str(msg.get("reason", "stop")), ws, streams
+                    )
+                )
+            return hello
+        if kind == "play_stop":
+            LOG.info("play_stop received: audio_id=%s reason=%s", msg.get("audio_id"), msg.get("reason"))
             return hello
         await ws.send(json.dumps({"type": "error", "code": "UNKNOWN_CONTROL"}))
         return hello
@@ -230,6 +376,11 @@ class VoiceServer:
         if stream is None:
             LOG.warning("dropped frame for unknown stream=%d", frame.stream_id)
             return
+
+        # Stop accepting further audio if stream is finalizing or finalized
+        if stream.finalizing or stream.finalized:
+            return
+
         if frame.codec != CODEC_PCM:
             stream.bad += 1
             LOG.warning("dropped non-PCM frame stream=%d", stream.stream_id)
@@ -241,8 +392,14 @@ class VoiceServer:
         max_pcm_bytes = MAX_STREAM_SECONDS * SAMPLE_RATE * 2
         if len(stream.pcm) + PCM_PAYLOAD_LEN > max_pcm_bytes:
             LOG.warning("max duration reached stream=%d", stream.stream_id)
-            self.finalize(stream, "max_duration")
-            del streams[stream.stream_id]
+            if not (stream.finalizing or stream.finalized):
+                stream.finalizing = True
+                self.finalize(stream, "max_duration")
+                streams.pop(stream.stream_id, None)
+                if stream.ws is not None:
+                    asyncio.create_task(
+                        self._finish_asr_worker_and_finalize(stream, "max_duration", stream.ws, streams)
+                    )
             return
 
         if frame.sample_offset != stream.expected_offset:
@@ -264,30 +421,42 @@ class VoiceServer:
                 )
                 return
 
-        if len(stream.pcm) + PCM_PAYLOAD_LEN > max_pcm_bytes:
-            LOG.warning("max duration reached stream=%d", stream.stream_id)
-            self.finalize(stream, "max_duration")
-            del streams[stream.stream_id]
-            return
         if stream.first_frame_ns is None:
             stream.first_frame_ns = time.perf_counter_ns()
         stream.pcm.extend(frame.payload)
         stream.frames += 1
         stream.expected_offset = frame.sample_offset + SAMPLES_PER_FRAME
 
-        # ASR processing: send audio to worker thread (non-blocking)
+        # ASR processing: send audio to worker thread in normalized 640-byte frames (non-blocking)
         asr_start_time = time.perf_counter()
         try:
             stream._ensure_asr_worker()
             asr_worker = stream.asr_worker
             if asr_worker is not None:
-                asr_worker.add_audio(frame.payload)
+                for chunk in stream.asr_frame_buffer.feed(frame.payload):
+                    asr_worker.add_audio(chunk)
         except Exception as e:
             LOG.warning("Failed to queue audio for ASR: %s", e)
         finally:
-            # Track ASR processing time (approximate)
             asr_end_time = time.perf_counter()
             stream.asr_processing_time_ms += (asr_end_time - asr_start_time) * 1000
+
+        # Endpoint detection: process audio for endpointing
+        try:
+            if stream.endpoint_detector is None:
+                stream.endpoint_detector = EndpointDetector(ENDPOINT_SILENCE_FRAMES, ENERGY_THRESHOLD)
+
+            if not stream.endpoint_triggered and not stream.finalizing and not stream.finalized:
+                if stream.endpoint_detector.process_frame(frame.payload):
+                    stream.endpoint_triggered = True
+                    stream.finalizing = True
+                    LOG.info("Endpoint detected for stream %d, initiating finalization", stream.stream_id)
+                    conn = stream.ws
+                    asyncio.create_task(
+                        self._finish_asr_worker_and_finalize(stream, "endpoint", conn, streams)
+                    )
+        except Exception as e:
+            LOG.warning("Error in endpoint detection: %s", e)
 
         # Check for ASR results (non-blocking)
         try:
@@ -301,6 +470,8 @@ class VoiceServer:
                         stream.keywords_detected += 1
                     if asr_result.is_final:
                         stream.final_result_count += 1
+                        if isinstance(asr_result.text, str) and asr_result.text.strip():
+                            stream.accumulated_text.append(asr_result.text.strip())
                         LOG.info(
                             "ASR result for stream %d: '%s' (final=%s)",
                             stream.stream_id,
@@ -308,9 +479,7 @@ class VoiceServer:
                             asr_result.is_final,
                         )
                     else:
-                        # Partial result
                         stream.partial_result_count += 1
-                        # Only log if partial text changed
                         if asr_result.text.strip() != stream.last_partial_text:
                             stream.last_partial_text = asr_result.text.strip()
                             LOG.debug(
@@ -322,6 +491,11 @@ class VoiceServer:
             LOG.warning("Error getting ASR result: %s", e)
 
     def finalize(self, stream: Stream, reason: str) -> Path:
+        # Prevent duplicate finalization
+        if stream.finalized:
+            return self.output_dir / f"stream-{stream.stream_id}.wav"
+        stream.finalized = True
+
         path = self.output_dir / f"stream-{stream.stream_id}.wav"
         with wave.open(str(path), "wb") as out:
             out.setnchannels(1)
@@ -346,8 +520,191 @@ class VoiceServer:
 
     def shutdown(self) -> None:
         """Clean up resources."""
-        # No shared resources to clean up; per-stream workers are stopped when the stream ends.
         pass
+
+    async def _finish_asr_worker(self, stream: Stream) -> Optional[ASRResult]:
+        """
+        Finish ASR worker in a background task to avoid blocking asyncio event loop.
+        This calls ASRWorker.finish() which may block on thread join.
+        """
+        try:
+            if stream.asr_worker is not None:
+                result = await asyncio.to_thread(stream.asr_worker.finish)
+                stream.asr_worker = None
+                if result is not None:
+                    stream.last_asr_result = result
+                    stream.asr_result_count += 1
+                    stream.final_result_count += 1
+                    LOG.info(
+                        "ASR final result for stream %d: '%s' (final=%s)",
+                        stream.stream_id,
+                        result.text,
+                        result.is_final,
+                    )
+                return result
+            return stream.last_asr_result
+        except Exception as e:
+            LOG.warning("Error finishing ASR worker for stream %d: %s", stream.stream_id, e)
+            return None
+
+    async def send_playback(
+        self,
+        ws: ServerConnection,
+        pcm_bytes: bytes,
+        audio_id: Optional[int] = None,
+        send_play_stop: bool = False,
+    ) -> int:
+        """Send play_start control message followed by binary PCM frames to device."""
+        if audio_id is None:
+            audio_id = self._next_audio_id
+            self._next_audio_id += 1
+
+        play_start_msg = {
+            "type": "play_start",
+            "audio_id": audio_id,
+            "codec": "pcm_s16le",
+            "sample_rate": 16000,
+            "channels": 1,
+            "frame_ms": 20,
+        }
+        LOG.info("[PLAYBACK] Sending play_start for audio_id=%d", audio_id)
+        await ws.send(json.dumps(play_start_msg))
+
+        # Pad to 640-byte frame boundary if needed
+        if len(pcm_bytes) % PCM_PAYLOAD_LEN != 0:
+            pad = PCM_PAYLOAD_LEN - (len(pcm_bytes) % PCM_PAYLOAD_LEN)
+            pcm_bytes = pcm_bytes + (b"\x00" * pad)
+
+        total_frames = len(pcm_bytes) // PCM_PAYLOAD_LEN
+        if total_frames == 0:
+            if send_play_stop:
+                await ws.send(json.dumps({"type": "play_stop", "audio_id": audio_id, "reason": "eof"}))
+                LOG.info("[PLAYBACK] Sent play_stop for audio_id=%d (empty audio)", audio_id)
+            return 0
+
+        for seq in range(total_frames):
+            flags = 0
+            if seq == 0:
+                flags |= FLAG_FIRST
+            if seq == total_frames - 1:
+                flags |= FLAG_LAST
+
+            payload = pcm_bytes[seq * PCM_PAYLOAD_LEN : (seq + 1) * PCM_PAYLOAD_LEN]
+            sample_offset = seq * SAMPLES_PER_FRAME
+            frame = AudioFrame(
+                codec=CODEC_PCM,
+                flags=flags,
+                seq=seq,
+                stream_id=audio_id,
+                sample_offset=sample_offset,
+                payload=payload,
+            )
+            await ws.send(pack(frame))
+
+        LOG.info("[PLAYBACK] Sent %d playback frames for audio_id=%d", total_frames, audio_id)
+
+        if send_play_stop:
+            play_stop_msg = {
+                "type": "play_stop",
+                "audio_id": audio_id,
+                "reason": "eof",
+            }
+            await ws.send(json.dumps(play_stop_msg))
+            LOG.info("[PLAYBACK] Sent play_stop for audio_id=%d", audio_id)
+
+        return total_frames
+
+    async def _finish_asr_worker_and_finalize(
+        self,
+        stream: Stream,
+        reason: str,
+        ws: Optional[ServerConnection] = None,
+        streams: Optional[dict[int, Stream]] = None,
+    ) -> None:
+        """
+        Finish ASR worker, finalize the stream, and run LLM -> TTS -> Playback.
+        """
+        try:
+            if stream.processing_response:
+                return
+            stream.processing_response = True
+
+            # 1. Authoritative final ASR
+            final_result = await self._finish_asr_worker(stream)
+            if isinstance(final_result, ASRResult) and isinstance(final_result.text, str) and final_result.text.strip():
+                stream.accumulated_text.append(final_result.text.strip())
+
+            # 2. Finalize stream WAV file if not already finalized
+            if not stream.finalized:
+                self.finalize(stream, reason)
+            if streams is not None:
+                streams.pop(stream.stream_id, None)
+
+            # 3. Check final transcript (accumulated, final result, or partial fallback)
+            valid_accumulated = [t for t in stream.accumulated_text if isinstance(t, str)]
+            final_text = " ".join(valid_accumulated).strip()
+            if not final_text and stream.last_asr_result and isinstance(stream.last_asr_result.text, str) and stream.last_asr_result.text.strip():
+                final_text = stream.last_asr_result.text.strip()
+            if not final_text and stream.last_partial_text and isinstance(stream.last_partial_text, str):
+                final_text = stream.last_partial_text.strip()
+
+            if not final_text:
+                LOG.info("[PIPELINE] Final transcript empty for stream %d; skipping LLM/TTS", stream.stream_id)
+                return
+
+            LOG.info("[PIPELINE] Final ASR text for stream %d: '%s'", stream.stream_id, final_text)
+
+            # 4. LLM Generation
+            if self._llm_provider is not None:
+                try:
+                    LOG.info("[LLM] Starting generation...")
+                    LOG.info("[LLM] INPUT: %s", final_text)
+                    llm_response, tel = await asyncio.to_thread(
+                        self._llm_provider.generate_with_telemetry, final_text
+                    )
+                    stream.last_llm_response = llm_response
+                    stream.last_llm_telemetry = tel
+                    LOG.info("[LLM] RESPONSE:\n%s", llm_response)
+                    LOG.info("[LLM] Generation complete for stream %d", stream.stream_id)
+                except Exception as e:
+                    LOG.error("[LLM] Generation failed for stream %d: %s", stream.stream_id, e)
+                    return
+            else:
+                return
+
+            if not stream.last_llm_response or not stream.last_llm_response.strip():
+                return
+
+            # 5. TTS Synthesis
+            pcm_audio = b""
+            if self._tts_provider is not None:
+                try:
+                    LOG.info("[TTS] Starting synthesis for stream %d: text='%s'", stream.stream_id, stream.last_llm_response.strip())
+                    pcm_audio = await asyncio.to_thread(
+                        self._tts_provider.synthesize_pcm, stream.last_llm_response.strip()
+                    )
+                    LOG.info("[TTS] Generated %d bytes PCM for stream %d", len(pcm_audio), stream.stream_id)
+                except Exception as e:
+                    LOG.error("[TTS] Synthesis failed for stream %d: %s", stream.stream_id, e)
+                    return
+            else:
+                return
+
+            if not pcm_audio:
+                return
+
+            # 6. Playback to ESP32 over WebSocket
+            conn = ws or stream.ws
+            if conn is not None:
+                try:
+                    LOG.info("[PLAYBACK] Initiating playback downlink for stream %d", stream.stream_id)
+                    await self.send_playback(conn, pcm_audio, audio_id=stream.stream_id, send_play_stop=True)
+                except Exception as e:
+                    LOG.warning("[PLAYBACK] Playback send failed for stream %d: %s", stream.stream_id, e)
+            else:
+                LOG.warning("[PLAYBACK] No active connection available for stream %d", stream.stream_id)
+        except Exception as e:
+            LOG.warning("Error in _finish_asr_worker_and_finalize for stream %d: %s", stream.stream_id, e)
 
 
 async def run(host: str, port: int, output_dir: Path) -> None:
